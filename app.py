@@ -10,6 +10,11 @@ async def generate_audio(text, voice, output_file):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(output_file)
 
+# Naya Health Check Route - Taki bot ko pata chale ki server zinda hai
+@app.route('/', methods=['GET'])
+def health_check():
+    return "OK", 200
+
 @app.route('/tts', methods=['POST'])
 def tts():
     data = request.json
@@ -17,17 +22,21 @@ def tts():
         return "Text not found", 400
     
     text = data['text']
-    # यदि कोई आवाज़ नहीं चुनी गई है, तो डिफ़ॉल्ट रूप से हिंदी आवाज़ का उपयोग होगा
     voice = data.get('voice', 'hi-IN-MadhurNeural')
     filename = f"temp_{uuid.uuid4().hex}.mp3"
     
-    asyncio.run(generate_audio(text, voice, filename))
-    
-    with open(filename, 'rb') as f:
-        audio_data = f.read()
+    try:
+        asyncio.run(generate_audio(text, voice, filename))
         
-    os.remove(filename)
-    return Response(audio_data, mimetype="audio/mpeg")
+        with open(filename, 'rb') as f:
+            audio_data = f.read()
+            
+        os.remove(filename)
+        return Response(audio_data, mimetype="audio/mpeg")
+    except Exception as e:
+        if os.path.exists(filename):
+            os.remove(filename)
+        return str(e), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
