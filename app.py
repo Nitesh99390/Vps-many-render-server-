@@ -1,49 +1,13 @@
 """
 =============================================================================
- Edge-TTS Render Server  (app.py)  -  v3.0 Professional Edition
+ Edge-TTS Render Server  (app.py)  -  v3.1 Professional Edition
 =============================================================================
  A production-ready Flask micro-service that converts text to speech using
  Microsoft Edge neural voices (edge-tts).
 
- Endpoints
- ---------
-   GET  /                 -> plain "OK" (keep-alive pingers)
-   GET  /health           -> JSON status, uptime, version, limits
-   GET  /stats            -> JSON runtime statistics (requests, cache, latency)
-   GET  /voices           -> voice catalogue   (?locale=hi-IN | ?lang=hi | ?gender=Male | ?q=madhur)
-   GET  /voices/locales   -> list of available locales with counts
-   POST /tts              -> JSON {text, voice, rate, pitch, volume} -> audio/mpeg
-   GET  /tts              -> same via query string (quick testing)
-   POST /tts/stream       -> chunked audio/mpeg streamed while synthesising
-   POST /tts/subtitles    -> JSON {duration_ms, srt, vtt, words[], audio_base64?}
-   GET  /tts/subtitles    -> same via query string
-
- Response headers on /tts
- ------------------------
-   X-Duration-Ms   spoken duration in milliseconds (from word boundaries)
-   X-Char-Count    number of characters synthesised
-   X-Voice         voice that was used
-   X-Cache         HIT | MISS
-   X-Request-ID    unique request id (echoed if client sends one)
-
- Environment variables (all optional)
- ------------------------------------
-   PORT               default 10000
-   API_KEY            if set, clients must send header  X-API-Key: <key>
-                      (or ?api_key=<key>)
-   MAX_TEXT_LENGTH    default 6000 characters per request
-   MAX_CONCURRENCY    default 6 simultaneous synth jobs
-   DEFAULT_VOICE      default hi-IN-MadhurNeural
-   TTS_RETRIES        default 3
-   RATE_LIMIT         requests per minute per IP (default 120, 0 = disabled)
-   CACHE_MAX_MB       in-memory audio cache size (default 64, 0 = disabled)
-   LOG_LEVEL          default INFO
-   ENABLE_CORS        default true
-
- Requirements
- ------------
-   pip install flask edge-tts gunicorn
-   Run (Render):  gunicorn app:app --workers 1 --threads 8 --timeout 300
+ Speed & Performance Optimizations Applied:
+ - MAX_CONCURRENCY boosted to 25 for massive parallel processing.
+ - RATE_LIMIT disabled (0) to prevent 429 Too Many Requests from master bot.
 =============================================================================
 """
 
@@ -68,16 +32,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import edge_tts
 from flask import Flask, Response, g, jsonify, request, stream_with_context
 
-try:  # Correct client IPs behind Render / Cloudflare proxies
+try:  
     from werkzeug.middleware.proxy_fix import ProxyFix
-except Exception:  # pragma: no cover
-    ProxyFix = None  # type: ignore
+except Exception:  
+    ProxyFix = None  
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 VERSION = "3.1.0"
-
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -85,22 +48,23 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
-
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
-
 PORT = _env_int("PORT", 10000)
 API_KEY = os.getenv("API_KEY", "").strip()
+
+# --- SPEED OPTIMIZATIONS ---
 MAX_TEXT_LENGTH = max(1, _env_int("MAX_TEXT_LENGTH", 6000))
-MAX_CONCURRENCY = max(1, _env_int("MAX_CONCURRENCY", 6))
-DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural").strip()
+MAX_CONCURRENCY = max(1, _env_int("MAX_CONCURRENCY", 25))   # Increased from 6 to 25
+RATE_LIMIT = _env_int("RATE_LIMIT", 0)                      # Disabled (0) to allow unlimited internal bot requests
 TTS_RETRIES = max(1, _env_int("TTS_RETRIES", 3))
-RATE_LIMIT = _env_int("RATE_LIMIT", 120)
+SYNTH_TIMEOUT = max(5, _env_int("SYNTH_TIMEOUT", 180))      
+
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural").strip()
 CACHE_MAX_BYTES = _env_int("CACHE_MAX_MB", 64) * 1024 * 1024
 ENABLE_CORS = _env_bool("ENABLE_CORS", True)
-VOICE_CACHE_TTL = 6 * 3600  # seconds
-SYNTH_TIMEOUT = max(5, _env_int("SYNTH_TIMEOUT", 180))  # whole request, including queue time
+VOICE_CACHE_TTL = 6 * 3600  
 TRUST_PROXY_HOPS = max(0, _env_int("TRUST_PROXY_HOPS", 0))
 
 logging.basicConfig(
@@ -119,25 +83,20 @@ MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 START_TIME = time.time()
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB request bodies
+app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024  
 app.config["JSON_SORT_KEYS"] = False
 app.json.sort_keys = False
 if ProxyFix is not None and TRUST_PROXY_HOPS:
-    # Enable only behind a trusted reverse proxy that overwrites forwarded headers.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUST_PROXY_HOPS, x_proto=TRUST_PROXY_HOPS)
 
-
 # ---------------------------------------------------------------------------
-# Background asyncio loop (safe with gunicorn threads / Flask threaded mode)
+# Background asyncio loop
 # ---------------------------------------------------------------------------
 class AsyncRunner:
-    """Runs coroutines on a single dedicated event loop living in a thread."""
-
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run, name="tts-loop", daemon=True)
         self._thread.start()
-        # Create the semaphore *inside* the loop for compatibility with all Python versions
         self.semaphore: asyncio.Semaphore = asyncio.run_coroutine_threadsafe(
             self._make_semaphore(), self.loop
         ).result(timeout=10)
@@ -155,23 +114,18 @@ class AsyncRunner:
         try:
             return fut.result(timeout=timeout)
         except FutureTimeoutError:
-            fut.cancel()  # Do not leave a timed-out job occupying a synthesis slot.
+            fut.cancel()  
             raise
 
     def submit(self, coro):
-        """Fire-and-forget schedule (returns concurrent.futures.Future)."""
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     @property
     def active(self) -> int:
-        # Semaphore internal value = remaining permits
         remaining = getattr(self.semaphore, "_value", MAX_CONCURRENCY)
         return MAX_CONCURRENCY - remaining
 
-
 class LazyRunner:
-    """Do not start threads at import time (gunicorn --preload forks afterwards)."""
-
     def __init__(self):
         self._instance = None
         self._lock = threading.Lock()
@@ -189,9 +143,7 @@ class LazyRunner:
     def active(self):
         return self._instance.active if self._instance is not None else 0
 
-
 runner = LazyRunner()
-
 
 # ---------------------------------------------------------------------------
 # Runtime statistics
@@ -246,12 +198,10 @@ class Stats:
                 "last_error_at": self.last_error_at,
             }
 
-
 stats = Stats()
 
-
 # ---------------------------------------------------------------------------
-# In-memory LRU audio cache (bounded by bytes)
+# In-memory LRU audio cache
 # ---------------------------------------------------------------------------
 class AudioCache:
     def __init__(self, max_bytes: int) -> None:
@@ -296,12 +246,10 @@ class AudioCache:
                 "max_bytes": self.max_bytes,
             }
 
-
 cache = AudioCache(CACHE_MAX_BYTES)
 
-
 # ---------------------------------------------------------------------------
-# Per-IP sliding-window rate limiter
+# Rate limiter
 # ---------------------------------------------------------------------------
 class RateLimiter:
     def __init__(self, per_minute: int) -> None:
@@ -324,25 +272,17 @@ class RateLimiter:
                 retry = int(60 - (now - dq[0])) + 1
                 return False, retry
             dq.append(now)
-            # opportunistic cleanup of idle IPs
             if len(self._hits) > 5000:
                 for k in [k for k, v in self._hits.items() if not v]:
                     self._hits.pop(k, None)
             return True, 0
 
-
 limiter = RateLimiter(RATE_LIMIT)
-
 
 # ---------------------------------------------------------------------------
 # Core synthesis
 # ---------------------------------------------------------------------------
 def _make_communicate(text: str, voice: str, rate: str, pitch: str, volume: str):
-    """Build an edge_tts.Communicate compatible with old & new edge-tts versions.
-
-    edge-tts >= 7 defaults to SentenceBoundary events; we request WordBoundary so
-    that accurate durations and word-level subtitles are available.
-    """
     try:
         return edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume, boundary="WordBoundary")
     except TypeError:
@@ -350,9 +290,7 @@ def _make_communicate(text: str, voice: str, rate: str, pitch: str, volume: str)
     try:
         return edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
     except TypeError:
-        # Very old edge-tts versions do not accept `pitch`
         return edge_tts.Communicate(text, voice, rate=rate, volume=volume)
-
 
 async def _synthesize_once(text: str, voice: str, rate: str, pitch: str, volume: str,
                            collect_words: bool = False):
@@ -365,7 +303,6 @@ async def _synthesize_once(text: str, voice: str, rate: str, pitch: str, volume:
         if ctype == "audio":
             audio.extend(chunk["data"])
         elif ctype in ("WordBoundary", "SentenceBoundary"):
-            # offsets are in 100-nanosecond ticks
             start = chunk.get("offset", 0) / 10_000
             dur = chunk.get("duration", 0) / 10_000
             duration_ms = max(duration_ms, int(start + dur))
@@ -375,10 +312,8 @@ async def _synthesize_once(text: str, voice: str, rate: str, pitch: str, volume:
         raise edge_tts.exceptions.NoAudioReceived("Empty audio stream")
     return bytes(audio), duration_ms, words
 
-
 async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
                      collect_words: bool = False):
-    """Synthesize with retry + concurrency limiting."""
     last_err: Optional[Exception] = None
     async with runner.semaphore:
         for attempt in range(1, TTS_RETRIES + 1):
@@ -387,7 +322,7 @@ async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
                     _synthesize_once(text, voice, rate, pitch, volume, collect_words),
                     timeout=max(1, (SYNTH_TIMEOUT - 3) / TTS_RETRIES),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc: 
                 last_err = exc
                 log.warning("Synthesis attempt %d/%d failed (%s): %s",
                             attempt, TTS_RETRIES, type(exc).__name__, exc)
@@ -395,13 +330,11 @@ async def synthesize(text: str, voice: str, rate: str, pitch: str, volume: str,
                     await asyncio.sleep(1.0 * attempt)
     raise RuntimeError(f"TTS failed after {TTS_RETRIES} attempts: {type(last_err).__name__}: {last_err}")
 
-
 # ---------------------------------------------------------------------------
 # Voice catalogue (cached)
 # ---------------------------------------------------------------------------
 _voice_cache: Dict[str, Any] = {"data": None, "ts": 0.0, "names": set()}
 _voice_lock = threading.Lock()
-
 
 def get_voices() -> List[Dict[str, Any]]:
     with _voice_lock:
@@ -426,19 +359,15 @@ def get_voices() -> List[Dict[str, Any]]:
             _voice_cache["ts"] = time.time()
             _voice_cache["names"] = {v["name"] for v in voices if v["name"]}
         return voices
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc: 
         log.error("Could not fetch voice list: %s", exc)
         return _voice_cache["data"] or []
 
-
 def voice_exists(name: str) -> Optional[bool]:
-    """True/False if catalogue is known, None if catalogue unavailable."""
     names = _voice_cache["names"]
-    # Validation must not block a request on a remote catalogue refresh.
     if not names or time.time() - _voice_cache["ts"] >= VOICE_CACHE_TTL:
         return None
     return name in names
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -457,7 +386,6 @@ def require_api_key(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-
 def rate_limited(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -471,11 +399,9 @@ def rate_limited(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-
 def _error(message: str, status: int = 400):
     payload = {"error": message, "status": status, "request_id": getattr(g, "request_id", None)}
     return jsonify(payload), status
-
 
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -484,30 +410,25 @@ def normalize_text(text: str) -> str:
     text = MULTI_NEWLINE_RE.sub("\n\n", text)
     return text.strip()
 
-
 def _payload() -> Optional[dict]:
     if request.method == "POST":
         payload = request.get_json(silent=True)
         if payload is None and request.form:
             payload = request.form.to_dict()
         if payload is None and request.mimetype == "text/plain" and request.data:
-            # Never treat malformed JSON as literal speech.
             try:
                 payload = {"text": request.data.decode("utf-8")}
             except UnicodeDecodeError:
                 payload = None
         if not isinstance(payload, dict):
             return None
-        # allow query-string overrides for voice/rate/etc. on POST
         for k in ("voice", "rate", "pitch", "volume"):
             if k not in payload and k in request.args:
                 payload[k] = request.args.get(k)
         return payload
     return request.args.to_dict()
 
-
 def _validate(params: dict):
-    """Return (clean_params, error_message)."""
     if not isinstance(params.get("text"), str):
         return None, "Field 'text' must be a string"
     text = normalize_text(params["text"])
@@ -521,13 +442,9 @@ def _validate(params: dict):
     pitch = str(params.get("pitch") or "+0Hz").strip().replace(" ", "")
     volume = str(params.get("volume") or "+0%").strip().replace(" ", "")
 
-    # Be lenient: "20%" -> "+20%", "10Hz" -> "+10Hz"
-    if rate and rate[0] not in "+-":
-        rate = "+" + rate
-    if pitch and pitch[0] not in "+-":
-        pitch = "+" + pitch
-    if volume and volume[0] not in "+-":
-        volume = "+" + volume
+    if rate and rate[0] not in "+-": rate = "+" + rate
+    if pitch and pitch[0] not in "+-": pitch = "+" + pitch
+    if volume and volume[0] not in "+-": volume = "+" + volume
 
     if not VOICE_RE.match(voice):
         return None, f"Invalid voice name: {voice!r} (example: hi-IN-MadhurNeural)"
@@ -543,20 +460,16 @@ def _validate(params: dict):
 
     return {"text": text, "voice": voice, "rate": rate, "pitch": pitch, "volume": volume}, None
 
-
 def _fmt_srt_time(ms: int) -> str:
     h, rem = divmod(ms, 3_600_000)
     m, rem = divmod(rem, 60_000)
     s, ms2 = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms2:03d}"
 
-
 def _fmt_vtt_time(ms: int) -> str:
     return _fmt_srt_time(ms).replace(",", ".")
 
-
 def build_subtitles(words: List[Dict[str, Any]], max_words: int = 8, max_ms: int = 4000):
-    """Group word boundaries into readable cues; returns (srt, vtt)."""
     cues: List[Tuple[int, int, str]] = []
     buf: List[str] = []
     start = 0
@@ -578,7 +491,6 @@ def build_subtitles(words: List[Dict[str, Any]], max_words: int = 8, max_ms: int
         vtt_lines += [f"{_fmt_vtt_time(s)} --> {_fmt_vtt_time(e)}", t, ""]
     return "\n".join(srt_lines).strip() + "\n", "\n".join(vtt_lines).strip() + "\n"
 
-
 # ---------------------------------------------------------------------------
 # Request lifecycle hooks
 # ---------------------------------------------------------------------------
@@ -591,7 +503,6 @@ def _before():
     if request.method == "OPTIONS" and ENABLE_CORS:
         resp = Response("", 204)
         return resp
-
 
 @app.after_request
 def _after(resp: Response):
@@ -606,14 +517,12 @@ def _after(resp: Response):
         )
     return resp
 
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET", "HEAD"])
 def root():
     return "OK", 200
-
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -631,7 +540,6 @@ def health():
         edge_tts_version=getattr(edge_tts, "__version__", "unknown"),
     )
 
-
 @app.route("/stats", methods=["GET"])
 @require_api_key
 def stats_route():
@@ -640,7 +548,6 @@ def stats_route():
     data["active_jobs"] = runner.active
     data["cache"] = cache.info()
     return jsonify(data)
-
 
 @app.route("/voices", methods=["GET"])
 @require_api_key
@@ -660,7 +567,6 @@ def voices():
         data = [v for v in data if q in (v["name"] or "").lower() or q in (v["friendly_name"] or "").lower()]
     return jsonify(count=len(data), voices=data)
 
-
 @app.route("/voices/locales", methods=["GET"])
 @require_api_key
 def voice_locales():
@@ -668,7 +574,6 @@ def voice_locales():
     for v in get_voices():
         counts[v["locale"] or "unknown"] = counts.get(v["locale"] or "unknown", 0) + 1
     return jsonify(count=len(counts), locales=[{"locale": k, "voices": n} for k, n in sorted(counts.items())])
-
 
 @app.route("/tts", methods=["POST", "GET"])
 @require_api_key
@@ -699,12 +604,11 @@ def tts():
             log.error("[%s] TTS error: %s", g.request_id, exc)
             stats.record(False, error=str(exc))
             return _error(str(exc), 502)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc: 
             log.exception("[%s] Unexpected TTS failure", g.request_id)
             stats.record(False, error=f"{type(exc).__name__}: {exc}")
             return _error(f"Internal error: {type(exc).__name__}: {exc}", 500)
         if not duration_ms:
-            # rough fallback estimate: ~15 characters per second
             duration_ms = int(len(params["text"]) / 15 * 1000)
         cache.put(ckey, audio, duration_ms)
 
@@ -730,12 +634,10 @@ def tts():
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-
 @app.route("/tts/stream", methods=["POST", "GET"])
 @require_api_key
 @rate_limited
 def tts_stream():
-    """Stream audio chunks as soon as they arrive (chunked transfer encoding)."""
     payload = _payload()
     if payload is None:
         return _error('Request body must be JSON: {"text": "..."}')
@@ -750,7 +652,6 @@ def tts_stream():
     deadline = started + SYNTH_TIMEOUT
 
     async def enqueue(item):
-        # queue.put() must not block the shared asyncio loop.
         while True:
             try:
                 q.put_nowait(item)
@@ -788,7 +689,6 @@ def tts_stream():
             raise queue.Empty
         return q.get(timeout=remaining)
 
-    # Get the first chunk BEFORE sending HTTP 200, so early failures are real errors.
     try:
         first = next_item()
     except queue.Empty:
@@ -818,7 +718,7 @@ def tts_stream():
             raise RuntimeError(failure) from exc
         except Exception as exc:
             failure = str(exc)
-            raise  # After headers, abort the response instead of claiming full success.
+            raise  
         finally:
             future.cancel()
             stats.record(completed, len(params["text"]), sent, time.monotonic() - started,
@@ -833,12 +733,10 @@ def tts_stream():
     resp.headers["X-Accel-Buffering"] = "no"
     return resp
 
-
 @app.route("/tts/subtitles", methods=["POST", "GET"])
 @require_api_key
 @rate_limited
 def tts_subtitles():
-    """Return word timings + SRT/VTT subtitles (and optionally base64 audio)."""
     payload = _payload()
     if payload is None:
         return _error('Request body must be JSON: {"text": "..."}')
@@ -859,7 +757,7 @@ def tts_subtitles():
     except RuntimeError as exc:
         stats.record(False, error=str(exc))
         return _error(str(exc), 502)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc: 
         log.exception("[%s] Unexpected subtitle failure", g.request_id)
         stats.record(False, error=str(exc))
         return _error(f"Internal error: {type(exc).__name__}: {exc}", 500)
@@ -888,7 +786,6 @@ def tts_subtitles():
         body["audio_mime"] = "audio/mpeg"
     return jsonify(body)
 
-
 # ---------------------------------------------------------------------------
 # Error handlers
 # ---------------------------------------------------------------------------
@@ -896,36 +793,30 @@ def tts_subtitles():
 def not_found(_):
     return _error("Not found", 404)
 
-
 @app.errorhandler(405)
 def method_not_allowed(_):
     return _error("Method not allowed", 405)
-
 
 @app.errorhandler(413)
 def too_large(_):
     return _error("Request body too large", 413)
 
-
 @app.errorhandler(500)
 def internal(_):
     return _error("Internal server error", 500)
 
-
 # ---------------------------------------------------------------------------
-# Startup: warm the voice catalogue in the background (non-blocking)
+# Startup: warm the voice catalogue
 # ---------------------------------------------------------------------------
 def _warm_voices() -> None:
     try:
         n = len(get_voices())
         log.info("Voice catalogue warmed: %d voices", n)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc: 
         log.warning("Voice warm-up failed: %s", exc)
-
 
 _warmup_lock = threading.Lock()
 _next_warmup = 0.0
-
 
 def _schedule_voice_warmup():
     global _next_warmup
@@ -935,7 +826,6 @@ def _schedule_voice_warmup():
             return
         _next_warmup = now + (VOICE_CACHE_TTL if _voice_cache["data"] else 60)
     threading.Thread(target=_warm_voices, name="voice-warmup", daemon=True).start()
-
 
 # ---------------------------------------------------------------------------
 # Entrypoint
